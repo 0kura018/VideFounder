@@ -1,4 +1,4 @@
-﻿import json
+import json
 import os
 from main import apply_feedback, get_profile, save_profiles, profiles
 
