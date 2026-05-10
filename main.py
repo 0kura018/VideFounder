@@ -1,4 +1,4 @@
-﻿import asyncio
+import asyncio
 import random
 import json
 import os
@@ -10,7 +10,7 @@ from aiogram.filters import Command
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from config import TOKEN, ADMIN_ID, YOUTUBE_API_KEY
-from youtube_api import fetch_youtube_candidates, pick_best_video, split_query, normalize
+from youtube_api import fetch_youtube_candidates, pick_best_video, pick_all_videos, split_query, normalize
 
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
@@ -18,12 +18,13 @@ dp = Dispatcher()
 USERS_FILE = "users.json"
 PROFILES_FILE = "profiles.json"
 
-DEFAULT_INTERESTS = ["ai", "python", "technology"]
+DEFAULT_INTERESTS = ["teto", "vocaloid", "music"]
 QUERY_TO_INTEREST_THRESHOLD = 3
 
 users: set[int] = set()
 profiles: dict[str, dict[str, Any]] = {}
 result_cache: dict[str, dict[str, Any]] = {}
+search_sessions: dict[str, dict[str, Any]] = {}
 waiting_for_search: set[int] = set()
 user_history: dict[int, set[str]] = {}
 user_tag_history: dict[int, list[list[str]]] = {}
@@ -200,6 +201,21 @@ def build_feedback_keyboard(result_id: str):
     return kb.as_markup()
 
 
+def build_search_keyboard(result_id: str, session_id: str, index: int, total: int):
+    kb = InlineKeyboardBuilder()
+    prev_index = (index - 1) % total
+    next_index = (index + 1) % total
+    kb.button(text="⬅️ Back", callback_data=f"nav:{session_id}:{prev_index}")
+    kb.button(text=f"{index + 1}/{total}", callback_data="noop")
+    kb.button(text="➡️ Next", callback_data=f"nav:{session_id}:{next_index}")
+    kb.adjust(3)
+    kb.row()
+    kb.button(text="👍 Like", callback_data=f"rate:{result_id}:like")
+    kb.button(text="👎 Dislike", callback_data=f"rate:{result_id}:dislike")
+    kb.adjust(3, 2)
+    return kb.as_markup()
+
+
 def store_result(owner_id: int, result: dict[str, Any], source_query: str):
     result_id = uuid.uuid4().hex[:12]
     result_cache[result_id] = {
@@ -241,7 +257,6 @@ async def send_best_video(message: types.Message, query: str, mode: str = "searc
 
     candidates = await asyncio.to_thread(fetch_youtube_candidates, YOUTUBE_API_KEY, query, 10, lang)
 
-    
     if not candidates and "," in query:
         shorter_query = ",".join(query.split(",")[:-1]).strip()
         if shorter_query:
@@ -250,29 +265,26 @@ async def send_best_video(message: types.Message, query: str, mode: str = "searc
     if not candidates:
         if message.chat.type == "private":
             await message.answer("Nothing found.")
-            return
-
-        await message.reply("Nothing found.")
-        return
-
-
-    filtered = [c for c in candidates if c.url not in seen_urls]
-
-    if not filtered:
-        seen_urls.clear()
-        filtered = candidates
-
-    best = pick_best_video(query, profile, filtered, recent_tags=recent_tags)
-    if not best:
-        if message.chat.type == "private":
-           await message.answer("Nothing found.")
         else:
             await message.reply("Nothing found.")
         return
 
+    filtered = [c for c in candidates if c.url not in seen_urls]
+    if not filtered:
+        seen_urls.clear()
+        filtered = candidates
+
+    all_results = pick_all_videos(query, profile, filtered, recent_tags=recent_tags)
+    if not all_results:
+        if message.chat.type == "private":
+            await message.answer("Nothing found.")
+        else:
+            await message.reply("Nothing found.")
+        return
+
+    best = all_results[0]
 
     seen_urls.add(best["url"])
-    
 
     if user_id not in user_tag_history:
         user_tag_history[user_id] = []
@@ -283,16 +295,27 @@ async def send_best_video(message: types.Message, query: str, mode: str = "searc
     result_id = store_result(user_id, best, query)
     text = format_one_result(best, query)
 
-    if message.chat.type == "private":
-       await message.answer(text, parse_mode="HTML")
-    else:
-        await message.answer(text, parse_mode="HTML")
+    session_id = uuid.uuid4().hex[:12]
+    search_sessions[session_id] = {
+        "owner_id": user_id,
+        "query": query,
+        "results": all_results,
+        "index": 0,
+        "result_ids": {0: result_id},
+    }
 
+    use_nav = len(all_results) > 1
+    if use_nav:
+        keyboard = build_search_keyboard(result_id, session_id, 0, len(all_results))
+    else:
+        keyboard = build_feedback_keyboard(result_id)
+
+    full_text = text + f"\n{best.get('url', '')}"
 
     if message.chat.type == "private":
-        await message.answer(best.get('url', ''), reply_markup=build_feedback_keyboard(result_id))
+        await message.answer(full_text, parse_mode="HTML", reply_markup=keyboard)
     else:
-        await message.reply(best.get('url', ''), reply_markup=build_feedback_keyboard(result_id))
+        await message.reply(full_text, parse_mode="HTML", reply_markup=keyboard)
 
 def build_recommendation_query(profile: dict[str, Any]) -> str:
     interests = profile.get("interests", [])
@@ -575,6 +598,57 @@ async def lang_set_callback(callback: types.CallbackQuery):
     save_profiles()
 
     await callback.message.edit_text(f"Language preference set to: {lang_code.capitalize()}")
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "noop")
+async def noop_callback(callback: types.CallbackQuery):
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("nav:"))
+async def nav_callback(callback: types.CallbackQuery):
+    try:
+        _, session_id, idx_str = callback.data.split(":")
+        new_index = int(idx_str)
+    except ValueError:
+        await callback.answer("Invalid", show_alert=False)
+        return
+
+    session = search_sessions.get(session_id)
+    if not session:
+        await callback.answer("Session expired", show_alert=False)
+        return
+
+    is_owner = callback.from_user.id == session["owner_id"]
+    is_group = callback.message.chat.type in ("group", "supergroup")
+    is_chat_admin = False
+    if is_group and not is_owner:
+        member = await callback.message.chat.get_member(callback.from_user.id)
+        is_chat_admin = member.status in ("creator", "administrator")
+    if not is_owner and not is_chat_admin:
+        await callback.answer("Not yours", show_alert=False)
+        return
+
+    results = session["results"]
+    if new_index < 0 or new_index >= len(results):
+        await callback.answer("No more results", show_alert=False)
+        return
+
+    session["index"] = new_index
+    result = results[new_index]
+
+    if new_index not in session["result_ids"]:
+        result_id = store_result(session["owner_id"], result, session["query"])
+        session["result_ids"][new_index] = result_id
+    else:
+        result_id = session["result_ids"][new_index]
+
+    desc = format_one_result(result, session["query"])
+    full_text = desc + f"\n{result.get('url', '')}"
+    keyboard = build_search_keyboard(result_id, session_id, new_index, len(results))
+
+    await callback.message.edit_text(full_text, parse_mode="HTML", reply_markup=keyboard)
     await callback.answer()
 
 
